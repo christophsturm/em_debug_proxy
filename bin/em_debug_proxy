@@ -1,0 +1,137 @@
+#!/usr/bin/env ruby
+require 'em-proxy'
+require 'optparse'
+require 'pp'
+
+inport=1978
+outport=1977
+sockpath = nil
+logfn=nil
+pidfile=nil
+daemonize=false
+delay_time=1
+
+OptionParser.new do |o|
+  o.on("--listen PORT", "Port to listen on") { |h| inport = h }
+  o.on("--send PORT", "Port to send to") { |p| outport = p }
+  o.on("--socket PATH", "path to socket for commands") { |p| sockpath = p }
+  o.on("--delay SECONDS", "Number of seconds to delay data") { |s| delay_time = s }
+  o.on("--log PATH", "log to file instead of stdout") {|p| logfn=p}
+  o.on("--pid PATH", "path to pid file") {|p| pidfile=p}
+  o.on("-d", "--daemonize") { daemonize = true }
+
+  o.on("--help", "cry for help") { puts o; exit }
+
+  o.parse!
+end
+
+if pidfile
+  # Raise early, before we lose stdout, in case we daemonize
+  fail("PID file #{ pidfile } already exists.") if File.file?(pidfile)
+end
+
+if daemonize
+  fail("I refuse to daemonize without a log file") unless logfn
+
+  exit if fork
+  Process.setsid
+  exit if fork
+
+  File.umask(0000)
+
+  $stdin.reopen("/dev/null")
+
+  $stdout.reopen(logfn, "a")
+  $stderr.reopen(logfn, "a")
+end
+
+if pidfile
+  open(pidfile, 'w') { |f| f.write("#{ Process.pid }") }
+  at_exit { File.unlink(pidfile) }
+end
+
+$logfile=logfn ? File.open(logfn,"a") : STDOUT
+$logfile.sync = true
+$logfile.puts("proxy listening on #{inport} and sending to #{outport}. Logging to #{logfn||'STDOUT'}")
+
+$0 = "proxy #{ inport }=>#{ outport }"
+
+$drop_next = false
+
+Signal.trap("TERM") do
+  EM.stop
+  exit
+end
+
+$delay_timers = {}
+
+$blacklist=[]
+module BlacklistMgr
+  def handle_command(data)
+    data=data.chomp
+    if data == "DELETE!"
+       $logfile.puts "Blacklist cleared."
+
+       if $delay_timers.keys.any?
+         $logfile.puts "Cancelling #{ $delay_timers.keys.length } timers"
+
+        $delay_timers.each do |(proc, timer)|
+          proc.call
+          timer.cancel
+        end
+
+        $delay_timers = {}
+     end
+
+      $blacklist=[]
+    elsif data == "DROP!"
+      $drop_next = true
+    else
+      $blacklist << data
+    end
+
+     send_data("OK\n")
+  end
+
+  def receive_data(data)
+    data.split("\n").each { |n| handle_command(n) }
+  end
+  attr_reader :blacklist
+end
+
+bm=BlacklistMgr
+EM.next_tick do
+  EventMachine.attach($stdin, bm) unless daemonize
+
+  if sockpath
+    EventMachine.start_unix_domain_server(File.expand_path(sockpath), bm)
+
+    at_exit { File.unlink(sockpath) }
+  end
+end
+
+Proxy.start(:host => "0.0.0.0", :port => inport) do |conn|
+  conn.server :srv, :host => "127.0.0.1", :port => outport
+  conn.on_data do |data|
+    if $drop_next
+      $logfile.puts("DROP:#{data}")
+      conn.close_connection
+      $drop_next=false
+    end
+
+    delay=$blacklist.any? {|entry| data.include?(entry) }
+    if delay
+      $logfile.puts("DELAY: #{data}")
+
+      callback = Proc.new { conn.relay_to_servers(data) }
+
+      $delay_timers[callback] = EM::Timer.new(delay_time, &callback)
+
+      :async
+    else
+      $logfile.puts("PASSTHROUGH:#{data}")
+      data
+    end
+  end
+end
+
